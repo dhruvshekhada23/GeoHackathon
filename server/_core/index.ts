@@ -7,14 +7,27 @@ import { publicPlatformScript } from "./publicConfig";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
+import { createOutdoorRouter, outdoorApiErrorHandler } from "../outdoor/routes";
 
 async function startServer() {
   const app = express();
   const server = createServer(app);
+  const allowedOrigins = new Set((process.env.FRONTEND_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean));
+  app.use((req, res, next) => {
+    const origin = req.header("origin");
+    if (origin && allowedOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+    }
+    if (req.method === "OPTIONS") return res.sendStatus(origin && allowedOrigins.has(origin) ? 204 : 403);
+    return next();
+  });
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
-  app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+  app.use(createOutdoorRouter());
   app.get("/api/platform/config.js", (_req, res) => {
     res.set("Cache-Control", "no-store").type("application/javascript").send(publicPlatformScript());
   });
@@ -27,6 +40,7 @@ async function startServer() {
       createContext,
     })
   );
+  app.use(outdoorApiErrorHandler);
   // development mode uses Vite, production mode uses static files
   if (process.env.NODE_ENV === "development") {
     await setupVite(app, server);

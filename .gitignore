@@ -1,6 +1,15 @@
 # Dependencies
 **/node_modules
 .pnpm-store/
+**/.venv/
+**/venv/
+__pycache__/
+*.py[cod]
+
+# Local model weights and geocoding/provider caches
+models/
+model-cache/
+.outdooriq-cache/
 
 # Build outputs
 dist/
@@ -13,6 +22,7 @@ build/
 .env.development.local
 .env.test.local
 .env.production.local
+.env.*.local
 
 # IDE and editor files
 .vscode/

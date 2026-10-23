@@ -188,6 +188,7 @@ export default defineConfig({
   },
   server: {
     host: true,
+    proxy: Object.fromEntries(["/api", "/recommend", "/docs", "/openapi.json", "/health"].map((route) => [route, { target: `http://127.0.0.1:${process.env.OUTDOORIQ_API_PORT || "3001"}`, changeOrigin: true }])),
     allowedHosts: [
       ".manuspre.computer",
       ".manus.computer",
