@@ -5,11 +5,13 @@ const NOMINATIM_AGENT = process.env.OUTDOORIQ_USER_AGENT || "OutdoorIQ/1.0 (open
 const GEOCODE_TTL_MS = 10 * 60 * 1000;
 const geocodeCache = new Map<string, { until: number; results: LocationResult[] }>();
 const nearbyCache = new Map<string, { until: number; results: OutdoorPlace[] }>();
+const nearbyFailureCache = new Map<string, { until: number; message: string; kind: "unavailable" | "no-match" }>();
 const NEARBY_TTL_MS = 3 * 60 * 1000;
+const NEARBY_FAILURE_TTL_MS = 20 * 1000;
 let lastNominatimRequest = 0;
 
 export class ProviderError extends Error {
-  constructor(message: string, readonly provider?: string, readonly status?: number) {
+  constructor(message: string, readonly provider?: string, readonly status?: number, readonly kind: "unavailable" | "no-match" = "unavailable") {
     super(message);
     this.name = "ProviderError";
   }
@@ -105,19 +107,48 @@ function classify(tags: Record<string, string>): { categories: string[]; activit
   if (["path", "footway", "track", "pedestrian"].includes(tags.highway)) categories.add("Walking path");
   if (tags.highway === "cycleway" || tags.route === "bicycle") categories.add("Cycle route");
   if (tags.route === "hiking" || tags.sac_scale) categories.add("Hiking trail");
-  if (tags.leisure === "sports_centre" || tags.leisure === "pitch" || tags.sport) categories.add(tags.sport ? `${tags.sport} facility` : "Sports facility");
+  if (tags.leisure === "sports_centre" || tags.leisure === "pitch" || tags.leisure === "stadium" || tags.sport) categories.add(tags.sport ? `${tags.sport} facility` : "Sports facility");
   if (tags.natural === "wood" || tags.landuse === "forest") categories.add("Green space");
   if (tags.tourism === "viewpoint") categories.add("Viewpoint");
   if (tags.amenity === "fitness_centre") categories.add("Fitness centre");
   if (tags.leisure === "track") categories.add("Athletics track");
   if (!categories.size && kind) categories.add(String(kind).replaceAll("_", " "));
   const activityTypes: Activity[] = ["walking"];
-  if (tags.highway === "cycleway" || tags.route === "bicycle" || tags.bicycle === "designated") activityTypes.push("cycling");
+  if (tags.highway === "cycleway" || tags.route === "bicycle" || tags.bicycle === "designated" || tags.sport === "cycling") activityTypes.push("cycling");
   if (["path", "footway", "track"].includes(tags.highway) || tags.route === "hiking" || tags.leisure === "park" || tags.natural === "wood" || tags.landuse === "forest") activityTypes.push("hiking");
-  if (["cycleway", "path", "track"].includes(tags.highway) || tags.leisure === "track" || tags.leisure === "park") activityTypes.push("running");
-  const name = text(tags.name) || categories.values().next().value || "Outdoor place";
+  if (["cycleway", "path", "track"].includes(tags.highway) || tags.leisure === "track" || tags.leisure === "park" || ["sports_centre", "pitch", "stadium"].includes(tags.leisure) || tags.sport === "running" || tags.sport === "athletics") activityTypes.push("running");
+  const fallbackName = categories.has("Park") ? "Unnamed park" : categories.has("Walking path") ? "Unnamed walking path" : categories.has("Cycle route") ? "Unnamed cycle route" : categories.has("Hiking trail") ? "Unnamed hiking trail" : categories.values().next().value || "Outdoor place";
+  const name = text(tags.name) || fallbackName;
   const desc = [tags.surface && `Surface: ${tags.surface}`, tags.access && `Access: ${tags.access}`].filter(Boolean).join(" · ");
   return { categories: [...categories], activityTypes: [...new Set(activityTypes)], name, description: desc || undefined };
+}
+
+function closestGeometryPoint(originLat: number, originLon: number, item: any): { latitude: number; longitude: number; distanceKm: number } | null {
+  const groups: any[][] = [];
+  if (Array.isArray(item.geometry)) groups.push(item.geometry);
+  if (Array.isArray(item.members)) for (const member of item.members) if (Array.isArray(member.geometry)) groups.push(member.geometry);
+  let best: { latitude: number; longitude: number; distanceKm: number } | null = null;
+  const consider = (lat: number, lon: number) => {
+    const distanceKm = haversineKm(originLat, originLon, lat, lon);
+    if (!best || distanceKm < best.distanceKm) best = { latitude: lat, longitude: lon, distanceKm };
+  };
+  const lonScale = 111.32 * Math.cos(originLat * Math.PI / 180), latScale = 110.574;
+  for (const group of groups) {
+    const points = group.flatMap((point: any) => {
+      const lat = finite(point?.lat), lon = finite(point?.lon);
+      return lat === null || lon === null ? [] : [{ lat, lon }];
+    });
+    points.forEach(point => consider(point.lat, point.lon));
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1], b = points[i];
+      const ax = (a.lon - originLon) * lonScale, ay = (a.lat - originLat) * latScale;
+      const bx = (b.lon - originLon) * lonScale, by = (b.lat - originLat) * latScale;
+      const vx = bx - ax, vy = by - ay;
+      const t = clamp(-(ax * vx + ay * vy) / (vx * vx + vy * vy || 1), 0, 1);
+      consider(a.lat + t * (b.lat - a.lat), a.lon + t * (b.lon - a.lon));
+    }
+  }
+  return best;
 }
 
 function overpassPlaces(data: any, latitude: number, longitude: number, radiusKm: number): OutdoorPlace[] {
@@ -125,15 +156,26 @@ function overpassPlaces(data: any, latitude: number, longitude: number, radiusKm
   const seen = new Set<string>();
   return data.elements.flatMap((item: any) => {
     const tags = item.tags && typeof item.tags === "object" ? item.tags as Record<string, string> : {};
-    const lat = finite(item.lat ?? item.center?.lat), lon = finite(item.lon ?? item.center?.lon);
-    if (lat === null || lon === null) return [];
+    const mappedOutdoorTag = ["park", "garden", "nature_reserve", "sports_centre", "pitch", "stadium", "track"].includes(tags.leisure)
+      || ["path", "footway", "cycleway", "track", "pedestrian"].includes(tags.highway)
+      || ["hiking", "bicycle"].includes(tags.route)
+      || ["wood", "scrub"].includes(tags.natural)
+      || tags.tourism === "viewpoint" || tags.amenity === "fitness_centre" || Boolean(tags.sport);
+    if (!mappedOutdoorTag) return [];
+    const centerLat = finite(item.lat ?? item.center?.lat), centerLon = finite(item.lon ?? item.center?.lon);
+    const centerDistance = centerLat === null || centerLon === null ? null : haversineKm(latitude, longitude, centerLat, centerLon);
+    const geometryPoint = closestGeometryPoint(latitude, longitude, item);
+    const useGeometryPoint = Boolean(geometryPoint && (centerDistance === null || geometryPoint.distanceKm < centerDistance));
+    const lat = useGeometryPoint ? geometryPoint!.latitude : centerLat;
+    const lon = useGeometryPoint ? geometryPoint!.longitude : centerLon;
+    const distance = useGeometryPoint ? geometryPoint!.distanceKm : centerDistance;
+    if (lat === null || lon === null || distance === null) return [];
     const key = `${String(tags.name || "").toLowerCase()}|${lat.toFixed(4)}|${lon.toFixed(4)}`;
     if (seen.has(key)) return [];
     seen.add(key);
-    const distanceKm = haversineKm(latitude, longitude, lat, lon);
-    if (distanceKm > radiusKm) return [];
+    if (distance > radiusKm) return [];
     const classified = classify(tags);
-    return [{ id: `osm:${item.type}:${item.id}`, name: classified.name, latitude: lat, longitude: lon, distanceKm: Math.round(distanceKm * 100) / 100, categories: classified.categories, activityTypes: classified.activityTypes, source: "OpenStreetMap" as const, openingHours: text(tags.opening_hours), surface: text(tags.surface), description: classified.description }];
+    return [{ id: `osm:${item.type}:${item.id}`, name: classified.name, latitude: lat, longitude: lon, distanceKm: Math.round(distance * 100) / 100, categories: classified.categories, activityTypes: classified.activityTypes, source: "OpenStreetMap" as const, openingHours: text(tags.opening_hours), surface: text(tags.surface), description: classified.description }];
   });
 }
 
@@ -149,7 +191,7 @@ function nominatimNearbyPlaces(data: any, latitude: number, longitude: number, r
     const type = String(row.type || "").toLowerCase();
     const klass = String(row.class || "").toLowerCase();
     const parks = ["park", "garden", "nature_reserve"];
-    const leisure = ["park", "garden", "nature_reserve", "sports_centre", "pitch", "track"];
+    const leisure = ["park", "garden", "nature_reserve", "sports_centre", "pitch", "stadium", "track"];
     const highways = ["path", "footway", "cycleway", "track", "pedestrian"];
     if (klass === "leisure" && leisure.includes(type)) tags.leisure ||= type;
     if (highways.includes(type) && (klass === "highway" || type === "cycleway")) tags.highway ||= type;
@@ -173,23 +215,49 @@ function nominatimNearbyPlaces(data: any, latitude: number, longitude: number, r
   });
 }
 
+function activityOverpassQuery(latitude: number, longitude: number, radiusM: number, activity: Activity) {
+  const around = `nwr(around:${radiusM},${latitude},${longitude})`;
+  const parks = `${around}[leisure~"^(park|garden|nature_reserve)$"]`;
+  const walkingPaths = `${around}[highway~"^(path|footway|pedestrian)$"]`;
+  const sportsGrounds = `${around}[leisure~"^(sports_centre|pitch|stadium)$"]`;
+  const selectors = activity === "cycling"
+    ? [`${around}[highway="cycleway"]`, `${around}[route="bicycle"]`, `${around}[sport="cycling"]`]
+    : activity === "running"
+      ? [`${around}[leisure~"^(park|track)$"]`, `${around}[highway~"^(path|footway|track)$"]`, sportsGrounds, `${around}[sport~"^(running|athletics)$"]`]
+      : activity === "hiking"
+        ? [`${around}[route="hiking"]`, `${around}[highway~"^(path|footway|track)$"]`, `${around}[natural~"^(wood|scrub)$"]`]
+        : [parks, walkingPaths];
+  return `[out:json][timeout:10];(${selectors.join(";")};);out geom tags 30;`;
+}
+
 export async function getNearbyPlaces(latitude: number, longitude: number, radiusKm: number, activity: Activity = "walking"): Promise<OutdoorPlace[]> {
   const cacheKey = `${latitude.toFixed(4)}:${longitude.toFixed(4)}:${radiusKm}:${activity}`;
   const cached = nearbyCache.get(cacheKey);
   if (cached && cached.until > Date.now()) return cached.results;
+  const recentFailure = nearbyFailureCache.get(cacheKey);
+  if (recentFailure && recentFailure.until > Date.now()) throw new ProviderError(recentFailure.message, "OpenStreetMap", undefined, recentFailure.kind);
+  nearbyFailureCache.delete(cacheKey);
   const radiusM = Math.round(radiusKm * 1000);
-  const query = `[out:json][timeout:20];(nwr(around:${radiusM},${latitude},${longitude})[leisure~"^(park|garden|nature_reserve|sports_centre|pitch|track)$"];nwr(around:${radiusM},${latitude},${longitude})[highway~"^(path|footway|cycleway|track|pedestrian)$"];nwr(around:${radiusM},${latitude},${longitude})[route~"^(hiking|bicycle)$"];nwr(around:${radiusM},${latitude},${longitude})[natural~"^(wood|scrub)$"];nwr(around:${radiusM},${latitude},${longitude})[tourism="viewpoint"];nwr(around:${radiusM},${latitude},${longitude})[sport];);out center tags 120;`;
-  const endpoints = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"];
+  const query = activityOverpassQuery(latitude, longitude, radiusM, activity);
+  const endpoints = ["https://overpass.openstreetmap.fr/api/interpreter", "https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter"];
   const init = { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }, body: `data=${encodeURIComponent(query)}` };
-  const responses = await Promise.allSettled(endpoints.map(endpoint => requestJson(endpoint, init, Math.min(12000, Math.max(TIMEOUT_MS, 8000)))));
   let lastError: unknown;
-  for (const result of responses) {
-    if (result.status === "rejected") { lastError = result.reason; continue; }
-    const places = overpassPlaces(result.value, latitude, longitude, radiusKm);
-    if (places.length) {
-      const ranked = places.slice(0, 100);
-      nearbyCache.set(cacheKey, { until: Date.now() + NEARBY_TTL_MS, results: ranked });
-      return ranked;
+  let overpassResponded = false;
+  let nominatimResponded = false;
+  for (const endpoint of endpoints) {
+    try {
+      const data = await requestJson(endpoint, init, Math.min(10000, Math.max(TIMEOUT_MS, 6000)));
+      overpassResponded = true;
+      const places = overpassPlaces(data, latitude, longitude, radiusKm);
+      if (places.length) {
+        const ranked = places.slice(0, 100);
+        nearbyCache.set(cacheKey, { until: Date.now() + NEARBY_TTL_MS, results: ranked });
+        nearbyFailureCache.delete(cacheKey);
+        return ranked;
+      }
+      lastError = new ProviderError("Overpass returned no matching outdoor features.", new URL(endpoint).hostname);
+    } catch (error) {
+      lastError = error;
     }
   }
   try {
@@ -199,16 +267,26 @@ export async function getNearbyPlaces(latitude: number, longitude: number, radiu
     const viewbox = [longitude - lonSpan, latitude + latSpan, longitude + lonSpan, latitude - latSpan].join(",");
     const term = activity === "cycling" ? "cycleway" : activity === "hiking" ? "trail" : "park";
     const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&extratags=1&limit=20&q=${encodeURIComponent(term)}&viewbox=${encodeURIComponent(viewbox)}&bounded=1`;
-    const fallback = nominatimNearbyPlaces(await requestJson(url, { headers: { "Accept-Language": "en" } }), latitude, longitude, radiusKm, activity).slice(0, 100);
+    const nominatimData = await requestJson(url, { headers: { "Accept-Language": "en" } });
+    nominatimResponded = true;
+    const fallback = nominatimNearbyPlaces(nominatimData, latitude, longitude, radiusKm, activity).slice(0, 100);
     if (fallback.length) {
       nearbyCache.set(cacheKey, { until: Date.now() + NEARBY_TTL_MS, results: fallback });
+      nearbyFailureCache.delete(cacheKey);
       return fallback;
     }
-    throw new ProviderError("OpenStreetMap Overpass timed out and the bounded Nominatim nearby search returned no matching places.", "OpenStreetMap");
+    const kind = overpassResponded || nominatimResponded ? "no-match" as const : "unavailable" as const;
+    const message = kind === "no-match"
+      ? "Nearby map data returned no verified outdoor places in this radius."
+      : `Nearby map services did not respond; the bounded fallback returned no verified places (${lastError instanceof Error ? lastError.message : "provider timeout"}).`;
+    nearbyFailureCache.set(cacheKey, { until: Date.now() + NEARBY_FAILURE_TTL_MS, message, kind });
+    throw new ProviderError(message, "OpenStreetMap", undefined, kind);
   } catch (error) {
     if (error instanceof ProviderError && error.provider === "OpenStreetMap") throw error;
     const reason = lastError instanceof Error ? lastError.message : error instanceof Error ? error.message : "provider timeout";
-    throw new ProviderError(`Nearby place search failed after Overpass fallback and bounded Nominatim search (${reason}).`, "OpenStreetMap");
+    const message = `Nearby map providers are temporarily unavailable (${reason}).`;
+    nearbyFailureCache.set(cacheKey, { until: Date.now() + NEARBY_FAILURE_TTL_MS, message, kind: "unavailable" });
+    throw new ProviderError(message, "OpenStreetMap", undefined, "unavailable");
   }
 }
 
@@ -260,4 +338,4 @@ export async function getAirQuality(latitude: number, longitude: number): Promis
   }
 }
 
-export function clearGeocodeCacheForTests() { geocodeCache.clear(); }
+export function clearProviderCachesForTests() { geocodeCache.clear(); nearbyCache.clear(); nearbyFailureCache.clear(); }

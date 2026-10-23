@@ -1,6 +1,7 @@
 import express from "express";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createOutdoorRouter, outdoorApiErrorHandler } from "./routes";
+import { ProviderError } from "./providers";
 import { haversineDistanceKm, scorePlaces } from "./recommend";
 import type { AirQualitySnapshot, LocationResult, OutdoorPlace, WeatherSnapshot } from "./types";
 
@@ -101,6 +102,16 @@ describe("OutdoorIQ HTTP API", () => {
     expect(data.recommendations).toEqual([]);
     expect(data.weather.status).toBe("available");
     expect(data.warnings[0]).toContain("no places have been invented");
+    nearbyOverride = vi.fn(async () => [park]);
+  });
+
+  it("labels a provider-confirmed zero-match result separately from an outage", async () => {
+    nearbyOverride = vi.fn(async () => { throw new ProviderError("No mapped features.", "OpenStreetMap", undefined, "no-match"); });
+    const response = await fetch(`${baseUrl}/recommend`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ location: { name: location.name, latitude: location.latitude, longitude: location.longitude }, activity: "walking", radiusKm: 5 }) });
+    const data = await response.json();
+    expect(response.status).toBe(200);
+    expect(data.warnings[0]).toContain("No verified mapped walking places were found within 5 km");
+    expect(data.warnings[0]).not.toContain("currently unavailable");
     nearbyOverride = vi.fn(async () => [park]);
   });
 

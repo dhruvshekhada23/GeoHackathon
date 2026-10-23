@@ -96,7 +96,11 @@ export function createOutdoorRouter(overrides: Partial<Dependencies> = {}) {
     ]);
     const warnings: string[] = [];
     const places = nearbyResult.status === "fulfilled" ? nearbyResult.value : [];
-    if (nearbyResult.status === "rejected") warnings.push(`Nearby place data is currently unavailable (${nearbyResult.reason instanceof Error ? nearbyResult.reason.message : "provider error"}); no places have been invented.`);
+    if (nearbyResult.status === "rejected") {
+      const nearbyError = nearbyResult.reason;
+      if (nearbyError instanceof ProviderError && nearbyError.kind === "no-match") warnings.push(`No verified mapped ${request.activity} places were found within ${request.radiusKm} km.`);
+      else warnings.push(`Nearby place data is currently unavailable (${nearbyError instanceof Error ? nearbyError.message : "provider error"}); no places have been invented.`);
+    }
     const weatherData = weather.status === "fulfilled" ? weather.value : { ...EMPTY_WEATHER, note: weather.reason instanceof Error ? weather.reason.message : EMPTY_WEATHER.note };
     const airData = airQuality.status === "fulfilled" ? airQuality.value : { ...EMPTY_AIR, note: airQuality.reason instanceof Error ? airQuality.reason.message : EMPTY_AIR.note };
     if (weatherData.status === "unavailable") warnings.push("Weather data is unavailable; weather was excluded from suitability scoring.");

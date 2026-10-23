@@ -17,3 +17,5 @@
 @media(max-width:390px){.topnav{gap:10px}.nav-link{font-size:9px}.hero-row h1{font-size:31px}.edition-tag{display:none}.activity-option{padding:0 8px;gap:7px}.activity-option small{font-size:8px}.condition-copy em{font-size:8px}.filter-row{gap:8px}}
 
 .pollutant-more{margin-top:3px;max-width:100%;font-size:8px;line-height:1.45;color:#657c65}.pollutant-more summary{width:max-content;max-width:100%;cursor:pointer;text-decoration:underline;text-decoration-color:#a4b49d;text-underline-offset:2px}.pollutant-more>span{display:block;padding-top:3px;color:#727f70;overflow-wrap:anywhere}
+
+.empty-results>strong{display:block;color:#34513a;line-height:1.5}.empty-results>p{max-width:430px;margin:8px auto 0;color:#6f7c6d;font-size:12px;line-height:1.6}.empty-retry{display:inline-flex;align-items:center;gap:7px;margin-top:12px;padding:8px 12px;border:1px solid #cbd8c6;border-radius:6px;background:#f2f6ee;color:#31573b;font:600 12px Arial,sans-serif;cursor:pointer}.empty-retry:hover{background:#e8f0e4}.empty-retry:focus-visible{outline:2px solid #5b8557;outline-offset:2px}.empty-retry:disabled{opacity:.6;cursor:wait}
